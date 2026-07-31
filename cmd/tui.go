@@ -25,11 +25,8 @@ func runTUI(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("读取配置失败: %w", err)
 	}
 
-	// 校验 git 仓库
-	repo, err := git.DetectRepo()
-	if err != nil {
-		return fmt.Errorf("当前目录不是 git 仓库: %w", err)
-	}
+	// 尝试探测 git 仓库；失败不阻塞，让用户仍可打开 TUI 管理环境/配置
+	repo, _ := git.DetectRepo()
 
 	return tui.Run(tui.Options{
 		Config: cfg,

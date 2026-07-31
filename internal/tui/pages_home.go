@@ -8,13 +8,22 @@ type homeModel struct {
 	list simpleList
 }
 
-func newHomeModel() homeModel {
-	items := []listItem{
-		{Title: "创建工作树", Description: "选择基线分支 + 环境 → 创建新 worktree", Value: "create"},
-		{Title: "管理工作树", Description: "列出、进入、删除现有 worktree", Value: "manage"},
-		{Title: "环境管理", Description: "编辑 ~/.wtc/environments 下的脚本环境", Value: "envs"},
-		{Title: "设置", Description: "worktree 根目录、会话模式、自动清理等", Value: "config"},
-		{Title: "退出", Value: "quit"},
+func newHomeModel(inRepo bool) homeModel {
+	var items []listItem
+	if inRepo {
+		items = []listItem{
+			{Title: "创建工作树", Description: "选择基线分支 + 环境 → 创建新 worktree", Value: "create"},
+			{Title: "管理工作树", Description: "列出、进入、删除现有 worktree", Value: "manage"},
+			{Title: "环境管理", Description: "编辑 ~/.wtc/environments 下的脚本环境", Value: "envs"},
+			{Title: "设置", Description: "worktree 根目录、会话模式、自动清理等", Value: "config"},
+			{Title: "退出", Value: "quit"},
+		}
+	} else {
+		items = []listItem{
+			{Title: "环境管理", Description: "编辑 ~/.wtc/environments 下的脚本环境", Value: "envs"},
+			{Title: "设置", Description: "worktree 根目录、会话模式、自动清理等", Value: "config"},
+			{Title: "退出", Value: "quit"},
+		}
 	}
 	return homeModel{list: newList("请选择操作", items)}
 }

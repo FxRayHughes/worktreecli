@@ -14,7 +14,7 @@ import (
 
 type manageModel struct {
 	list   simpleList
-	log    strings.Builder
+	log    string
 	loaded bool
 }
 
@@ -82,8 +82,7 @@ func (m Model) updateManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		m.manage.log.Reset()
-		m.manage.log.WriteString(okStyle.Render("✓ 已删除") + "\n")
+		m.manage.log = okStyle.Render("✓ 已删除") + "\n"
 		return m, m.loadWorktrees()
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -115,16 +114,17 @@ func (m Model) launchSelectedManageItem() (tea.Model, tea.Cmd) {
 	if m.eval {
 		evalW = &evalStdoutWriter{}
 	}
-	m.manage.log.Reset()
-	_ = launcher.Launch(wt.Path, &m.manage.log, evalW, "")
+	var buf strings.Builder
+	_ = launcher.Launch(wt.Path, &buf, evalW, "")
+	m.manage.log = buf.String()
 	return m, nil
 }
 
 func (m Model) viewManage() string {
 	body := m.manage.list.View(m.listHeight())
 	log := ""
-	if m.manage.log.Len() > 0 {
-		log = "\n" + panelStyle.Render(m.manage.log.String())
+	if m.manage.log != "" {
+		log = "\n" + panelStyle.Render(m.manage.log)
 	}
 	return body + log + "\n\n"
 }
@@ -133,7 +133,7 @@ func (m Model) viewManage() string {
 
 type envListModel struct {
 	list simpleList
-	log  strings.Builder
+	log  string
 }
 
 func (m Model) enterEnvListPage() (tea.Model, tea.Cmd) {
@@ -169,8 +169,7 @@ func (m Model) updateEnvList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = err
 				return m, nil
 			}
-			m.envList.log.Reset()
-			m.envList.log.WriteString(okStyle.Render("✓ 已创建: "+p) + "\n")
+			m.envList.log = okStyle.Render("✓ 已创建: "+p) + "\n"
 			return m.enterEnvListPage()
 		}
 	}
@@ -185,17 +184,21 @@ func (m Model) updateEnvList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	path := envPath(sel.Value.(string))
-	m.envList.log.Reset()
-	m.envList.log.WriteString(subtleStyle.Render("已定位到: "+path) + "\n")
-	m.envList.log.WriteString(subtleStyle.Render("请在系统编辑器中打开修改。") + "\n")
+	if err := openInEditor(path); err != nil {
+		m.envList.log = errStyle.Render("打开编辑器失败: "+err.Error()) + "\n"
+		m.envList.log += subtleStyle.Render("文件路径: "+path) + "\n"
+	} else {
+		m.envList.log = okStyle.Render("✓ 已用系统关联程序打开") + "\n"
+		m.envList.log += subtleStyle.Render(path) + "\n"
+	}
 	return m, nil
 }
 
 func (m Model) viewEnvList() string {
 	body := m.envList.list.View(m.listHeight())
 	log := ""
-	if m.envList.log.Len() > 0 {
-		log = "\n" + panelStyle.Render(m.envList.log.String())
+	if m.envList.log != "" {
+		log = "\n" + panelStyle.Render(m.envList.log)
 	}
 	return body + log + "\n\n"
 }
@@ -203,7 +206,7 @@ func (m Model) viewEnvList() string {
 // ─── 配置页 ─────────────────────────
 
 type configModel struct {
-	log strings.Builder
+	log string
 }
 
 func (m Model) enterConfigPage() (tea.Model, tea.Cmd) {
@@ -240,8 +243,7 @@ func (m Model) updateConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err
 		} else {
-			m.conf.log.Reset()
-			m.conf.log.WriteString(okStyle.Render("✓ 已保存配置") + "\n")
+			m.conf.log = okStyle.Render("✓ 已保存配置") + "\n"
 		}
 	}
 	return m, nil
@@ -268,8 +270,8 @@ func (m Model) viewConfig() string {
 		"会话模式:     " + session.ModeLabel(m.cfg.SessionMode),
 	}
 	body := panelStyle.Render(strings.Join(lines, "\n"))
-	if m.conf.log.Len() > 0 {
-		body += "\n" + m.conf.log.String()
+	if m.conf.log != "" {
+		body += "\n" + m.conf.log
 	}
 	return body + "\n\n" + "\n" +
 		subtleStyle.Render("详细字段请直接编辑 config.yml") + "\n" +

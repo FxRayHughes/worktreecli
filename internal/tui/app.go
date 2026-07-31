@@ -96,7 +96,7 @@ func newModel(opts Options) Model {
 		page: pageHome,
 		pick: pickState{session: opts.Config.SessionMode},
 	}
-	m.home = newHomeModel()
+	m.home = newHomeModel(opts.Repo != nil)
 	return m
 }
 
@@ -156,7 +156,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 实现 tea.Model
 func (m Model) View() string {
 	title := titleStyle.Render("wtc — Git Worktree 快捷管理")
-	sub := subtleStyle.Render(fmt.Sprintf("仓库: %s   分支: %s", m.repo.Name, currentBranchDisplay(m.repo)))
+	var subText string
+	if m.repo != nil {
+		subText = fmt.Sprintf("仓库: %s   分支: %s", m.repo.Name, currentBranchDisplay(m.repo))
+	} else {
+		subText = "未在 git 仓库内（可管理环境与设置；创建/管理工作树需要进入 git 仓库）"
+	}
+	sub := subtleStyle.Render(subText)
 	var body string
 	switch m.page {
 	case pageHome:

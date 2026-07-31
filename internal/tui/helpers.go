@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -36,6 +37,27 @@ func envDirPath() (string, error) {
 
 func saveCfg(cfg *config.Config) error {
 	return config.Save(cfg)
+}
+
+// openInEditor 用系统关联程序打开文件
+// Windows: rundll32 shell32.dll,ShellExec_RunDLL
+// macOS: open
+// Linux: xdg-open
+func openInEditor(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	var cmd *osexec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// 用 rundll32 触发 ShellExecute 打开关联程序
+		cmd = osexec.Command("rundll32", "url.dll,FileProtocolHandler", path)
+	case "darwin":
+		cmd = osexec.Command("open", path)
+	default:
+		cmd = osexec.Command("xdg-open", path)
+	}
+	return cmd.Start()
 }
 
 func createNewEnvFile() (string, error) {
