@@ -4,7 +4,9 @@
 
 灵感来源于 ChatGPT Codex / Claude Code 桌面端的"新建工作树"面板：为每个正在做的事情起一个独立工作树，配一个可配置的初始化脚本环境。
 
-![screenshot placeholder](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" alt="wtc TUI 主菜单" width="720" />
+</p>
 
 ## 特性
 
