@@ -1,0 +1,24 @@
+# 构建产物
+/wtc
+/wtc.exe
+/worktreecli
+/worktreecli.exe
+/dist/
+
+# 计划、临时
+*.log
+*.tmp
+*.stale/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.test
+*.prof
