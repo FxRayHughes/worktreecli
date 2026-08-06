@@ -49,12 +49,15 @@ func (m Model) removeCurrent() tea.Cmd {
 	wt := sel.Value.(git.Worktree)
 	repo := m.repo
 	return func() tea.Msg {
-		// 若匹配到同名环境 cleanup，则先执行（尝试从 wt/<name> 反推环境比较复杂，此处跳过）
 		if err := repo.RemoveWorktree(wt.Path); err != nil {
 			return removeDoneMsg{err: err}
 		}
-		// 可选：删除目录残留
 		_ = os.RemoveAll(wt.Path)
+		// 顺带删除该 worktree 对应的分支「wt/<name> 命名规则」
+		// wt.Branch 是 git worktree list 报告的当前分支
+		if wt.Branch != "" {
+			_ = repo.DeleteBranch(wt.Branch)
+		}
 		return removeDoneMsg{err: nil}
 	}
 }

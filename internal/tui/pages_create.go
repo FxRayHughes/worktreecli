@@ -104,6 +104,11 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	b := sel.Value.(git.Branch)
 	m.pick.baseBranch = b.Name
+	// 强制把选中的本地分支同步到远程最新，避免用户从过期基线创建 worktree
+	if err := m.repo.FetchBranch(b.Name); err != nil {
+		// 分支被占用时 FetchBranch 返回错误，但会话继续 —— 用户可以看到提示
+		m.err = err
+	}
 	return m.enterEnvPage()
 }
 
