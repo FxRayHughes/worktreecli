@@ -84,9 +84,26 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "f":
 			if !m.branch.fetching {
+				sel := m.branch.list.Selected()
+				if sel == nil {
+					return m, nil
+				}
+				b := sel.Value.(git.Branch)
 				m.branch.fetching = true
 				m.branch.fetchedMsg = ""
-				return m, m.fetchRemote()
+				return m, m.fetchSelected(b.Name)
+			}
+		case "c":
+			// 切换 wtc 所在目录的分支到目标分支并拉取
+			if !m.branch.fetching {
+				sel := m.branch.list.Selected()
+				if sel == nil {
+					return m, nil
+				}
+				b := sel.Value.(git.Branch)
+				m.branch.fetching = true
+				m.branch.fetchedMsg = ""
+				return m, m.checkoutAndPull(b.Name)
 			}
 		case "enter":
 			activate = true
@@ -104,18 +121,31 @@ func (m Model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	b := sel.Value.(git.Branch)
 	m.pick.baseBranch = b.Name
-	// 强制把选中的本地分支同步到远程最新，避免用户从过期基线创建 worktree
-	if err := m.repo.FetchBranch(b.Name); err != nil {
-		// 分支被占用时 FetchBranch 返回错误，但会话继续 —— 用户可以看到提示
-		m.err = err
-	}
 	return m.enterEnvPage()
+}
+
+// fetchSelected 拉取指定分支的最新代码
+// 分支被占用时会自动切到那个 worktree 里 pull
+func (m Model) fetchSelected(branch string) tea.Cmd {
+	repo := m.repo
+	return func() tea.Msg {
+		return fetchDoneMsg{err: repo.FetchBranch(branch)}
+	}
+}
+
+// checkoutAndPull 把 wtc 所在目录切到 branch 并拉最新
+func (m Model) checkoutAndPull(branch string) tea.Cmd {
+	repo := m.repo
+	return func() tea.Msg {
+		return fetchDoneMsg{err: repo.CheckoutAndPull(branch)}
+	}
 }
 
 func branchButtons() []hotBtn {
 	return []hotBtn{
 		{"下一步", "enter"},
-		{"拉取远程", "f"},
+		{"拉取分支", "f"},
+		{"切换并拉取", "c"},
 		{"返回", "esc"},
 	}
 }

@@ -81,6 +81,38 @@ func (r *Repo) DeleteBranch(branch string) error {
 	return nil
 }
 
+// CheckoutAndPull 把主仓库切到 branch 并 pull 最新
+// 目标场景：用户在基线分支页按 c，主动切换 wtc 所在目录到目标分支并拉最新
+// 该操作会破坏 wtc 所在目录当前分支的工作状态（若有未提交更改会失败）
+// 若 branch 是远程分支「origin/xxx」，先建立本地跟踪分支再 checkout
+func (r *Repo) CheckoutAndPull(branch string) error {
+	if strings.Contains(branch, "/") {
+		// 远程分支：切一个同名的本地跟踪分支
+		parts := strings.SplitN(branch, "/", 2)
+		localName := parts[1]
+		// 若本地已有同名分支则直接 checkout
+		if err := exec.Command("git", "-C", r.Root, "show-ref", "--verify", "--quiet", "refs/heads/"+localName).Run(); err == nil {
+			branch = localName
+		} else {
+			// 建立跟踪分支
+			cmd := exec.Command("git", "-C", r.Root, "checkout", "-b", localName, "--track", branch)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("checkout -b %s --track %s 失败: %s", localName, branch, strings.TrimSpace(string(out)))
+			}
+			// 切完就已经是最新（远程 ref 里的 sha）
+			return nil
+		}
+	}
+	// 本地分支：checkout + pull --ff-only
+	if out, err := exec.Command("git", "-C", r.Root, "checkout", branch).CombinedOutput(); err != nil {
+		return fmt.Errorf("checkout %s 失败: %s", branch, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("git", "-C", r.Root, "pull", "--ff-only", "origin", branch).CombinedOutput(); err != nil {
+		return fmt.Errorf("pull %s 失败: %s", branch, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // Fetch 拉取所有远程
 func (r *Repo) Fetch() error {
 	cmd := exec.Command("git", "-C", r.Root, "fetch", "--all", "--prune")
@@ -91,30 +123,64 @@ func (r *Repo) Fetch() error {
 	return nil
 }
 
-// FetchBranch 强制把本地分支 branch 更新到远程最新
-// 如果 branch 是远程分支「origin/main」，直接返回（worktree add 时用远程 ref 即可）
-// 如果 branch 是本地分支，且存在对应远程跟踪分支「origin/<branch>」，
-// 用 `git fetch origin <branch>:<branch>` 强制更新本地引用
-// 若本地分支已 check out 到主 worktree，fetch 到分支的方式会失败，回退到 fast-forward 拉取
+// FetchBranch 更新指定分支到远程最新
+// 处理策略：
+// 1. 远程分支「origin/xxx」→ 只拉远程跟踪引用「git fetch origin xxx」
+// 2. 本地分支未被 checkout → git fetch origin <b>:<b> 强制更新
+// 3. 本地分支被某个 worktree checkout → 在那个 worktree 目录里 git pull --ff-only
 func (r *Repo) FetchBranch(branch string) error {
-	// 远程分支不需要更新，worktree add 会直接用它
 	if strings.Contains(branch, "/") {
+		// 远程分支：只更新远程引用
+		parts := strings.SplitN(branch, "/", 2)
+		remote, name := parts[0], parts[1]
+		cmd := exec.Command("git", "-C", r.Root, "fetch", remote, name)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("fetch %s 失败: %s", branch, strings.TrimSpace(string(out)))
+		}
 		return nil
 	}
-	// 先看远程有没有对应分支
+
+	// 本地分支：先确认远程有对应分支
 	remoteRef := "refs/remotes/origin/" + branch
 	if err := exec.Command("git", "-C", r.Root, "show-ref", "--verify", "--quiet", remoteRef).Run(); err != nil {
-		// 没有远程对应分支 → 什么都不做，本地分支为准
+		return nil // 无远程对应分支，跳过
+	}
+
+	// 尝试 fetch <b>:<b> —— 未 checkout 的分支能成功
+	cmd := exec.Command("git", "-C", r.Root, "fetch", "origin", branch+":"+branch)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
 		return nil
 	}
-	// 尝试 fetch <branch>:<branch> —— 强制把本地引用推到远程最新
-	// 若本地分支正被某个 worktree checkout，该操作会失败，回退到 pull --ff-only
-	cmd := exec.Command("git", "-C", r.Root, "fetch", "origin", branch+":"+branch)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		// 分支被占用，回退：直接把远程分支的 sha 用于 worktree add
-		// 这里返回一个特定错误让调用方感知，但不当作致命
-		return fmt.Errorf("fetch %s 失败「本地分支可能被占用，将使用远程 origin/%s」: %s",
-			branch, branch, strings.TrimSpace(string(out)))
+
+	// 失败：分支正在某个 worktree 里 checkout；找到它并在那里 pull
+	wtPath := r.findWorktreeForBranch(branch)
+	if wtPath == "" {
+		return fmt.Errorf("fetch %s 失败: %s", branch, strings.TrimSpace(string(out)))
+	}
+	pullCmd := exec.Command("git", "-C", wtPath, "pull", "--ff-only", "origin", branch)
+	if pullOut, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
+		return fmt.Errorf("在 %s 上 pull %s 失败: %s", wtPath, branch, strings.TrimSpace(string(pullOut)))
 	}
 	return nil
+}
+
+// findWorktreeForBranch 找出 branch 当前被哪个 worktree checkout；找不到返回空
+func (r *Repo) findWorktreeForBranch(branch string) string {
+	trees, err := r.ListWorktrees()
+	if err != nil {
+		return ""
+	}
+	for _, t := range trees {
+		if t.Branch == branch {
+			return t.Path
+		}
+	}
+	// 主仓库也可能 checkout 了该分支
+	if head, err := exec.Command("git", "-C", r.Root, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
+		if strings.TrimSpace(string(head)) == branch {
+			return r.Root
+		}
+	}
+	return ""
 }
