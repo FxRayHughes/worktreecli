@@ -13,9 +13,10 @@ import (
 )
 
 type manageModel struct {
-	list   simpleList
-	log    string
-	loaded bool
+	list           simpleList
+	log            string
+	loaded         bool
+	pendingRemoves map[string]bool // 正在后台删除中的 worktree 路径集合
 }
 
 type worktreesLoadedMsg struct {
@@ -25,7 +26,10 @@ type worktreesLoadedMsg struct {
 
 func (m Model) enterManagePage() (tea.Model, tea.Cmd) {
 	m.page = pageManage
-	m.manage = manageModel{list: newList("已有 worktree（d 删除, Enter 进入, Esc 返回）", nil)}
+	m.manage = manageModel{
+		list:           newList("已有 worktree（d 删除, Enter 进入, Esc 返回）", nil),
+		pendingRemoves: map[string]bool{},
+	}
 	return m, m.loadWorktrees()
 }
 
@@ -40,17 +44,25 @@ func (m Model) loadWorktrees() tea.Cmd {
 type removeDoneMsg struct {
 	err  error
 	name string
+	path string
 }
 
 // removeCurrent 触发删除
-// 返回值：(立即从列表移除该项的新 Model, 后台执行删除的 Cmd)
-// 让 TUI 立刻反馈"已从列表消失"，真正的 git worktree remove / branch -D 在后台跑
+// 立即从 UI 移除并把路径记入 pendingRemoves，后台异步做 git 操作
+// 完成后 removeDoneMsg 会把路径从 pendingRemoves 移除
+// 期间任何 worktreesLoadedMsg 都会过滤掉正在删除中的项，避免磁盘 IO 竞态导致"复活"
 func (m Model) removeCurrent() (Model, tea.Cmd) {
 	sel := m.manage.list.Selected()
 	if sel == nil {
 		return m, nil
 	}
 	wt := sel.Value.(git.Worktree)
+	// 加入 pending 集合
+	if m.manage.pendingRemoves == nil {
+		m.manage.pendingRemoves = map[string]bool{}
+	}
+	m.manage.pendingRemoves[wt.Path] = true
+
 	// 立即从列表里移除该项
 	newItems := make([]listItem, 0, len(m.manage.list.items))
 	for _, it := range m.manage.list.items {
@@ -60,7 +72,8 @@ func (m Model) removeCurrent() (Model, tea.Cmd) {
 		newItems = append(newItems, it)
 	}
 	m.manage.list.SetItems(newItems)
-	m.manage.log = subtleStyle.Render(fmt.Sprintf("正在后台删除: %s", wt.Name)) + "\n"
+	pendingCount := len(m.manage.pendingRemoves)
+	m.manage.log = subtleStyle.Render(fmt.Sprintf("后台删除中: %d 个 worktree", pendingCount)) + "\n"
 
 	repo := m.repo
 	return m, func() tea.Msg {
@@ -71,7 +84,7 @@ func (m Model) removeCurrent() (Model, tea.Cmd) {
 				_ = repo.DeleteBranch(wt.Branch)
 			}
 		}
-		return removeDoneMsg{err: err, name: wt.Name}
+		return removeDoneMsg{err: err, name: wt.Name, path: wt.Path}
 	}
 }
 
@@ -85,6 +98,10 @@ func (m Model) updateManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		items := make([]listItem, 0, len(msg.trees))
 		for _, t := range msg.trees {
+			// 过滤掉正在后台删除中的 worktree，避免磁盘还没删完时刷新出现"复活"
+			if m.manage.pendingRemoves[t.Path] {
+				continue
+			}
 			items = append(items, listItem{
 				Title:       t.Name,
 				Description: fmt.Sprintf("%s  [%s]", t.Path, t.Branch),
@@ -94,12 +111,20 @@ func (m Model) updateManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.manage.list.SetItems(items)
 		return m, nil
 	case removeDoneMsg:
+		// 从 pending 集合里移除完成的项
+		if m.manage.pendingRemoves != nil {
+			delete(m.manage.pendingRemoves, msg.path)
+		}
 		if msg.err != nil {
 			m.err = msg.err
-			return m, nil
 		}
-		m.manage.log = okStyle.Render("✓ 已删除") + "\n"
-		return m, m.loadWorktrees()
+		// 全部并发删除完成后才刷新列表，避免中间态导致"复活"
+		if len(m.manage.pendingRemoves) == 0 {
+			m.manage.log = okStyle.Render("✓ 全部后台删除已完成") + "\n"
+			return m, m.loadWorktrees()
+		}
+		m.manage.log = subtleStyle.Render(fmt.Sprintf("后台删除中: 剩余 %d 个", len(m.manage.pendingRemoves))) + "\n"
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "q":
