@@ -38,27 +38,40 @@ func (m Model) loadWorktrees() tea.Cmd {
 }
 
 type removeDoneMsg struct {
-	err error
+	err  error
+	name string
 }
 
-func (m Model) removeCurrent() tea.Cmd {
+// removeCurrent 触发删除
+// 返回值：(立即从列表移除该项的新 Model, 后台执行删除的 Cmd)
+// 让 TUI 立刻反馈"已从列表消失"，真正的 git worktree remove / branch -D 在后台跑
+func (m Model) removeCurrent() (Model, tea.Cmd) {
 	sel := m.manage.list.Selected()
 	if sel == nil {
-		return nil
+		return m, nil
 	}
 	wt := sel.Value.(git.Worktree)
+	// 立即从列表里移除该项
+	newItems := make([]listItem, 0, len(m.manage.list.items))
+	for _, it := range m.manage.list.items {
+		if w, ok := it.Value.(git.Worktree); ok && w.Path == wt.Path {
+			continue
+		}
+		newItems = append(newItems, it)
+	}
+	m.manage.list.SetItems(newItems)
+	m.manage.log = subtleStyle.Render(fmt.Sprintf("正在后台删除: %s", wt.Name)) + "\n"
+
 	repo := m.repo
-	return func() tea.Msg {
-		if err := repo.RemoveWorktree(wt.Path); err != nil {
-			return removeDoneMsg{err: err}
+	return m, func() tea.Msg {
+		err := repo.RemoveWorktree(wt.Path)
+		if err == nil {
+			_ = os.RemoveAll(wt.Path)
+			if wt.Branch != "" {
+				_ = repo.DeleteBranch(wt.Branch)
+			}
 		}
-		_ = os.RemoveAll(wt.Path)
-		// 顺带删除该 worktree 对应的分支「wt/<name> 命名规则」
-		// wt.Branch 是 git worktree list 报告的当前分支
-		if wt.Branch != "" {
-			_ = repo.DeleteBranch(wt.Branch)
-		}
-		return removeDoneMsg{err: nil}
+		return removeDoneMsg{err: err, name: wt.Name}
 	}
 }
 
@@ -93,7 +106,8 @@ func (m Model) updateManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.page = pageHome
 			return m, nil
 		case "d":
-			return m, m.removeCurrent()
+			nm, cmd := m.removeCurrent()
+			return nm, cmd
 		case "enter":
 			return m.launchSelectedManageItem()
 		case "r":
