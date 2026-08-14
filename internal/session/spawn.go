@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,11 +18,12 @@ type spawnLauncher struct{}
 func (s *spawnLauncher) Label() string { return "spawn" }
 
 func (s *spawnLauncher) Launch(path string, out io.Writer, _ io.Writer, initScript string) error {
-	if err := spawnTerminal(path, initScript); err != nil {
+	via, err := spawnTerminal(path, initScript)
+	if err != nil {
 		printf(out, "\n打开新终端失败: %v\n回退到打印模式：\n", err)
 		return (&printLauncher{}).Launch(path, out, nil, initScript)
 	}
-	printf(out, "\n已打开新终端窗口，工作目录: %s\n", path)
+	printf(out, "\n已打开新终端窗口 (%s)，工作目录: %s\n", via, path)
 	if strings.TrimSpace(initScript) != "" {
 		printf(out, "onSpawned 脚本已注入到新终端执行\n")
 	}
@@ -44,7 +46,8 @@ func writeInitScript(script string, isWindows bool) (string, error) {
 	return p, nil
 }
 
-func spawnTerminal(path, initScript string) error {
+// spawnTerminal 打开一个新终端窗口，返回用到的方式（用于给用户显示）
+func spawnTerminal(path, initScript string) (string, error) {
 	switch runtime.GOOS {
 	case "windows":
 		return spawnWindows(path, initScript)
@@ -55,7 +58,7 @@ func spawnTerminal(path, initScript string) error {
 	}
 }
 
-func spawnWindows(path, initScript string) error {
+func spawnWindows(path, initScript string) (string, error) {
 	// 把 Set-Location 与 initScript 合成一个 ps1 文件
 	// 避免 wt.exe / powershell 的 -Command 参数拼接坑
 	body := "Set-Location -LiteralPath " + psSingleQuote(path) + "\n"
@@ -67,7 +70,7 @@ func spawnWindows(path, initScript string) error {
 	}
 	scriptPath, err := writeInitScript(body, true)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// 选可用的 PowerShell
 	psExe := "powershell.exe"
@@ -81,7 +84,7 @@ func spawnWindows(path, initScript string) error {
 			"-ExecutionPolicy", "Bypass",
 			"-File", scriptPath)
 		if err := cmd.Start(); err == nil {
-			return nil
+			return "Windows Terminal", nil
 		}
 	}
 	// 回退 cmd 启动
@@ -89,7 +92,10 @@ func spawnWindows(path, initScript string) error {
 		"-NoExit", "-NoProfile",
 		"-ExecutionPolicy", "Bypass",
 		"-File", scriptPath)
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	return "PowerShell", nil
 }
 
 // psSingleQuote 把字符串包成 PowerShell 单引号字面量（内部单引号 → 两个单引号）
@@ -97,34 +103,159 @@ func psSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-func spawnMac(path, initScript string) error {
-	if _, err := exec.LookPath("osascript"); err != nil {
-		return errors.New("osascript 不可用")
-	}
-	// AppleScript do script 里 " 需要转义为 \"
-	inline := "cd " + quotePath(path)
+// spawnMac 在 macOS 上开一个新终端窗口，有两条路径：
+//
+//  1. osascript 驱动 Terminal / iTerm：命令被送进一个已经加载过 rc 的交互式 shell，
+//     onSpawned 语义最完整；但需要「自动化」权限（TCC），
+//     用户一旦点过“不允许”，之后会一直静默失败。
+//  2. open 打开一个临时 .command 包装脚本：不需要任何权限，作为兜底。
+//
+// 之前只有路径 1，而且用的是 cmd.Start() —— osascript 的报错（例如权限被拒的
+// -1743）根本不会被看到，于是表现成“提示已打开新终端，但什么都没发生”。
+func spawnMac(path, initScript string) (string, error) {
+	initPath := ""
 	if strings.TrimSpace(initScript) != "" {
 		p, err := writeInitScript(initScript, false)
 		if err != nil {
-			return err
+			return "", err
 		}
-		inline += "; . " + quotePath(p)
+		initPath = p
 	}
-	// 把双引号转成 AppleScript 字面量
-	escaped := strings.ReplaceAll(inline, "\"", "\\\"")
-	script := fmt.Sprintf(`tell application "Terminal"
-	activate
-	do script "%s"
-end tell`, escaped)
-	return exec.Command("osascript", "-e", script).Start()
+
+	apps := macTerminalApps()
+	var errs []string
+
+	// 路径 1：AppleScript
+	if _, err := exec.LookPath("osascript"); err == nil {
+		inline := "cd " + quotePath(path)
+		if initPath != "" {
+			inline += "; . " + quotePath(initPath)
+		}
+		for _, app := range apps {
+			if app.appleScript == nil {
+				continue
+			}
+			if err := runOsascript(app.appleScript(inline)); err != nil {
+				errs = append(errs, fmt.Sprintf("osascript→%s: %v", app.name, err))
+				continue
+			}
+			return app.name, nil
+		}
+	} else {
+		errs = append(errs, "osascript 不可用")
+	}
+
+	// 路径 2：.command 包装脚本 + open（不依赖自动化权限）
+	wrapper, err := writeMacWrapper(path, initPath)
+	if err != nil {
+		errs = append(errs, "写包装脚本失败: "+err.Error())
+		return "", errors.New(strings.Join(errs, "; "))
+	}
+	for _, app := range apps {
+		out, err := exec.Command("open", "-a", app.name, wrapper).CombinedOutput()
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("open -a %s: %v %s", app.name, err, strings.TrimSpace(string(out))))
+			continue
+		}
+		return app.name + " (.command)", nil
+	}
+	return "", errors.New(strings.Join(errs, "; "))
 }
 
-func spawnLinux(path, initScript string) error {
+// macApp 一个可以拿来开新窗口的 macOS 终端 App
+type macApp struct {
+	name        string                     // open -a / AppleScript 里用的名字
+	appleScript func(inline string) string // nil 表示不走 AppleScript
+}
+
+// macTerminalApps 返回候选终端，优先用户当前所在的那个，最后一定兜底到 Terminal.app
+//
+// 只挑 Terminal / iTerm：这两个都能直接执行 .command 文件。其他终端
+// （Ghostty / Warp / WezTerm / VS Code / tmux 里…）统一落到 Terminal.app，
+// 它在任何 macOS 上都存在。
+func macTerminalApps() []macApp {
+	terminal := macApp{name: "Terminal", appleScript: func(inline string) string {
+		return fmt.Sprintf(`tell application "Terminal"
+	activate
+	do script "%s"
+end tell`, appleScriptString(inline))
+	}}
+	iterm := macApp{name: "iTerm", appleScript: func(inline string) string {
+		return fmt.Sprintf(`tell application "iTerm"
+	activate
+	set w to (create window with default profile)
+	tell current session of w to write text "%s"
+end tell`, appleScriptString(inline))
+	}}
+	if macInITerm() {
+		return []macApp{iterm, terminal}
+	}
+	return []macApp{terminal}
+}
+
+func macInITerm() bool {
+	if strings.EqualFold(os.Getenv("TERM_PROGRAM"), "iTerm.app") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(os.Getenv("__CFBundleIdentifier")), "iterm")
+}
+
+// appleScriptString 转义成 AppleScript 双引号字面量（\ 和 " 都要转）
+func appleScriptString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
+}
+
+// runOsascript 同步执行 AppleScript，把 stderr 当成错误内容带回来
+// （必须 Wait，否则权限被拒之类的错误会被完全吞掉）
+func runOsascript(script string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "osascript", "-e", script).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return err
+		}
+		return fmt.Errorf("%v: %s", err, msg)
+	}
+	return nil
+}
+
+// writeMacWrapper 生成一个 .command 包装脚本：cd 到 worktree、跑 onSpawned、留一个交互式 shell
+func writeMacWrapper(path, initPath string) (string, error) {
+	name := fmt.Sprintf("wtc-spawn-%d.command", time.Now().UnixNano())
+	wrapper := filepath.Join(os.TempDir(), name)
+
+	// 用 $SHELL -i 而不是 sh，这样 rc 会被加载，onSpawned 里写 nvm/conda 之类才有效；
+	// 之后再 exec 一个交互式 shell 把窗口留住（导出的环境变量会被继承）
+	last := `exec "$SHELL" -i`
+	if initPath != "" {
+		last = `exec "$SHELL" -i -c ` + shellSingleQuote(". "+quotePath(initPath)+`; exec "$SHELL" -i`)
+	}
+	// 临时文件延迟自删，避免 sh 还在按块读脚本时把自己删掉
+	cleanup := "( sleep 30; rm -f " + quotePath(wrapper)
+	if initPath != "" {
+		cleanup += " " + quotePath(initPath)
+	}
+	cleanup += " ) >/dev/null 2>&1 &"
+
+	body := "#!/bin/sh\n" +
+		"cd " + quotePath(path) + " || exit 1\n" +
+		cleanup + "\n" +
+		last + "\n"
+	if err := os.WriteFile(wrapper, []byte(body), 0o700); err != nil {
+		return "", err
+	}
+	return wrapper, nil
+}
+
+func spawnLinux(path, initScript string) (string, error) {
 	inline := "cd " + quotePath(path)
 	if strings.TrimSpace(initScript) != "" {
 		p, err := writeInitScript(initScript, false)
 		if err != nil {
-			return err
+			return "", err
 		}
 		inline += "; . " + quotePath(p)
 	}
@@ -144,10 +275,13 @@ func spawnLinux(path, initScript string) error {
 	}
 	for _, c := range candidates {
 		if _, err := exec.LookPath(c.bin); err == nil {
-			return exec.Command(c.bin, c.args...).Start()
+			if err := exec.Command(c.bin, c.args...).Start(); err != nil {
+				return "", err
+			}
+			return c.bin, nil
 		}
 	}
-	return errors.New("未找到可用的终端模拟器")
+	return "", errors.New("未找到可用的终端模拟器")
 }
 
 func shellSingleQuote(s string) string {
