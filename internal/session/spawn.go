@@ -105,12 +105,14 @@ func psSingleQuote(s string) string {
 
 // spawnMac 在 macOS 上开一个新终端窗口，有两条路径：
 //
-//  1. osascript 驱动 Terminal / iTerm：命令被送进一个已经加载过 rc 的交互式 shell，
-//     onSpawned 语义最完整；但需要「自动化」权限（TCC），
-//     用户一旦点过“不允许”，之后会一直静默失败。
-//  2. open 打开一个临时 .command 包装脚本：不需要任何权限，作为兜底。
+//  1. open 打开一个临时 .command 包装脚本：不走 Apple Events，
+//     既不需要「自动化」权限，也不会弹授权框（弹框会一直挡着直到用户点，
+//     而那个框常常藏在终端窗口后面）。默认走这条。
+//  2. osascript 驱动 Terminal / iTerm：命令被送进一个已经加载过 rc 的交互式
+//     shell，语义最原汁原味，但需要 TCC 授权，用户点过“不允许”就永久失败。
+//     只在路径 1 失败时兜底。
 //
-// 之前只有路径 1，而且用的是 cmd.Start() —— osascript 的报错（例如权限被拒的
+// 最早只有路径 2，而且用的是 cmd.Start() —— osascript 的报错（例如权限被拒的
 // -1743）根本不会被看到，于是表现成“提示已打开新终端，但什么都没发生”。
 func spawnMac(path, initScript string) (string, error) {
 	initPath := ""
@@ -125,39 +127,38 @@ func spawnMac(path, initScript string) (string, error) {
 	apps := macTerminalApps()
 	var errs []string
 
-	// 路径 1：AppleScript
-	if _, err := exec.LookPath("osascript"); err == nil {
-		inline := "cd " + quotePath(path)
-		if initPath != "" {
-			inline += "; . " + quotePath(initPath)
-		}
+	// 路径 1：.command 包装脚本 + open
+	if wrapper, err := writeMacWrapper(path, initPath); err != nil {
+		errs = append(errs, "写包装脚本失败: "+err.Error())
+	} else {
 		for _, app := range apps {
-			if app.appleScript == nil {
-				continue
-			}
-			if err := runOsascript(app.appleScript(inline)); err != nil {
-				errs = append(errs, fmt.Sprintf("osascript→%s: %v", app.name, err))
+			out, err := exec.Command("open", "-a", app.name, wrapper).CombinedOutput()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("open -a %s: %v %s", app.name, err, strings.TrimSpace(string(out))))
 				continue
 			}
 			return app.name, nil
 		}
-	} else {
-		errs = append(errs, "osascript 不可用")
 	}
 
-	// 路径 2：.command 包装脚本 + open（不依赖自动化权限）
-	wrapper, err := writeMacWrapper(path, initPath)
-	if err != nil {
-		errs = append(errs, "写包装脚本失败: "+err.Error())
+	// 路径 2：AppleScript 兜底
+	if _, err := exec.LookPath("osascript"); err != nil {
+		errs = append(errs, "osascript 不可用")
 		return "", errors.New(strings.Join(errs, "; "))
 	}
+	inline := "cd " + quotePath(path)
+	if initPath != "" {
+		inline += "; . " + quotePath(initPath)
+	}
 	for _, app := range apps {
-		out, err := exec.Command("open", "-a", app.name, wrapper).CombinedOutput()
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("open -a %s: %v %s", app.name, err, strings.TrimSpace(string(out))))
+		if app.appleScript == nil {
 			continue
 		}
-		return app.name + " (.command)", nil
+		if err := runOsascript(app.appleScript(inline)); err != nil {
+			errs = append(errs, fmt.Sprintf("osascript→%s: %v", app.name, err))
+			continue
+		}
+		return app.name + " (AppleScript)", nil
 	}
 	return "", errors.New(strings.Join(errs, "; "))
 }

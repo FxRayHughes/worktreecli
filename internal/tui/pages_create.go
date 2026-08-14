@@ -1,10 +1,14 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/FxRayHughes/worktreecli/internal/config"
@@ -393,6 +397,11 @@ type runningModel struct {
 	tick    int    // spinner 帧
 	done    bool
 	failure error
+
+	sw      *streamWriter      // 脚本输出，只取最新一行显示
+	out     string             // sw 的快照（每个 tick 刷新一次）
+	startAt time.Time          // 用于显示已运行时长
+	cancel  context.CancelFunc // 中止脚本（连子孙进程一起杀）
 }
 
 type createStepMsg struct {
@@ -414,25 +423,73 @@ func waitStep() tea.Cmd {
 	}
 }
 
-// streamWriter 用于接收脚本 stdout/stderr —— 丢弃内容
-// 只保留 wtc 自己 push 的阶段标签，避免脚本输出把 UI 撑破
-type streamWriter struct{}
+// streamWriter 接收脚本 stdout/stderr，只留最新一行给 UI 展示
+//
+// 不往 runningStream 灌：pnpm install 这类脚本一秒能刷几百行，
+// 灌进事件循环会把 UI 冲垮。这里只维护"最后一行"，UI 按 tick 来取，
+// 于是既不会撑破布局，用户也能看出脚本到底还在动没有 —— 之前是整个丢掉，
+// 一个下载得一小时的 pnpm install 和真死锁在界面上长得一模一样。
+type streamWriter struct {
+	mu   sync.Mutex
+	part []byte // 还没凑成一行的尾巴
+	last string
+}
+
+// ansiRe 用来剥掉进度条的颜色/光标控制序列
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07`)
 
 func (s *streamWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.part = append(s.part, p...)
+	// 进度条用 \r 原地刷新，两种换行都当行分隔
+	if i := bytes.LastIndexAny(s.part, "\r\n"); i >= 0 {
+		for _, line := range bytes.FieldsFunc(s.part[:i], func(r rune) bool { return r == '\r' || r == '\n' }) {
+			if t := strings.TrimSpace(ansiRe.ReplaceAllString(string(line), "")); t != "" {
+				s.last = t
+			}
+		}
+		s.part = append([]byte(nil), s.part[i+1:]...)
+	}
+	// 脚本一行不换地刷输出时别把内存吃光
+	if len(s.part) > 8192 {
+		s.part = s.part[len(s.part)-4096:]
+	}
 	return len(p), nil
 }
 
-func (s *streamWriter) Flush() {}
+// Flush 把最后没换行的一截也交出来
+func (s *streamWriter) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t := strings.TrimSpace(ansiRe.ReplaceAllString(string(s.part), "")); t != "" {
+		s.last = t
+	}
+	s.part = nil
+}
+
+// Last 最新一行脚本输出
+func (s *streamWriter) Last() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
 
 func (m Model) enterRunningPage() (tea.Model, tea.Cmd) {
+	ctx, cancel := context.WithCancel(context.Background())
 	m.page = pageCreateRunning
-	m.running = runningModel{stage: "Creating worktree..."}
-	go m.runCreateAsync()
+	m.running = runningModel{
+		stage:   "Creating worktree...",
+		sw:      &streamWriter{},
+		startAt: time.Now(),
+		cancel:  cancel,
+	}
+	go m.runCreateAsync(ctx, m.running.sw)
 	return m, tea.Batch(waitStep(), tickCmd())
 }
 
 // runCreateAsync 后台跑创建流程，通过 runningStream 送状态更新
-func (m Model) runCreateAsync() {
+func (m Model) runCreateAsync(ctx context.Context, sw *streamWriter) {
 	pick := m.pick
 	repo := m.repo
 
@@ -461,9 +518,13 @@ func (m Model) runCreateAsync() {
 		BaseBranch:     pick.baseBranch,
 	}
 	runningStream <- createStepMsg{line: "[wtc] 执行环境 onCreate 脚本..."}
-	sw := &streamWriter{}
-	err = env.Run(context.Background(), envDef, env.PhaseCreate, vars, sw)
+	err = env.Run(ctx, envDef, env.PhaseCreate, vars, sw)
 	sw.Flush()
+	if ctx.Err() != nil {
+		// 用户按 Esc 中止：脚本（连子孙进程）已经被杀掉，不用再报错
+		runningStream <- createDoneMsg{err: errors.New("已中止 onCreate 脚本（worktree 已创建，可在管理面板删除）")}
+		return
+	}
 	if err != nil {
 		runningStream <- createDoneMsg{err: fmt.Errorf("脚本执行失败: %w", err)}
 		return
@@ -485,9 +546,17 @@ func (m Model) updateRunning(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.enterDonePage()
 	case tickMsg:
 		m.running.tick++
+		if m.running.sw != nil {
+			m.running.out = m.running.sw.Last()
+		}
 		return m, tickCmd()
 	case tea.KeyMsg:
 		if msg.String() == "esc" || msg.String() == "q" {
+			// 先把脚本（含 pnpm/node 这些子孙进程）杀掉再退，
+			// 否则 wtc 关了脚本还在后台跑，用户重试几次就攒出一堆并发任务
+			if m.running.cancel != nil {
+				m.running.cancel()
+			}
 			return m, tea.Quit
 		}
 	}
@@ -519,8 +588,27 @@ func (m Model) viewRunning() string {
 	}
 	stage = truncateForDisplay(stage, maxWidth)
 	title := okStyle.Render(frame + " " + stage)
-	hint := subtleStyle.Render("按 Esc/q 可中断")
-	return "\n" + title + "\n\n" + hint
+
+	// 已运行时长 + 脚本最新一行输出：
+	// onCreate 里跑 pnpm install / 构建动辄几分钟，没有这两行没法判断是慢还是卡死
+	body := ""
+	if !m.running.startAt.IsZero() {
+		body += "\n  " + subtleStyle.Render("已运行 "+formatElapsed(time.Since(m.running.startAt)))
+	}
+	if m.running.out != "" {
+		body += "\n  " + subtleStyle.Render("› "+truncateForDisplay(m.running.out, maxWidth-4))
+	}
+	hint := subtleStyle.Render("按 Esc/q 中止脚本并退出")
+	return "\n" + title + body + "\n\n" + hint
+}
+
+// formatElapsed 把时长显示成 mm:ss（超过一小时带上小时）
+func formatElapsed(d time.Duration) string {
+	s := int(d.Seconds())
+	if s >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+	}
+	return fmt.Sprintf("%02d:%02d", s/60, s%60)
 }
 
 // truncateForDisplay 按 rune 数截断，超长加 …
@@ -541,7 +629,7 @@ func truncateForDisplay(s string, max int) string {
 //
 
 type doneModel struct {
-	output strings.Builder
+	output string
 }
 
 func (m Model) enterDonePage() (tea.Model, tea.Cmd) {
@@ -549,23 +637,44 @@ func (m Model) enterDonePage() (tea.Model, tea.Cmd) {
 	m.done = doneModel{}
 	// 如果失败，直接展示错误
 	if m.running.failure != nil {
-		m.done.output.WriteString(errStyle.Render("失败: "+m.running.failure.Error()) + "\n")
+		m.done.output = errStyle.Render("失败: "+m.running.failure.Error()) + "\n"
 		return m, nil
 	}
-	m.done.output.WriteString(okStyle.Render("✓ worktree 创建成功") + "\n")
-	// 触发会话启动
-	launcher := session.New(m.pick.session)
-	var evalW *evalStdoutWriter
-	if m.eval {
-		evalW = &evalStdoutWriter{}
+	m.done.output = okStyle.Render("✓ worktree 创建成功") + "\n" + subtleStyle.Render("正在进入会话...") + "\n"
+	// 会话启动走异步 tea.Cmd：spawn 模式要开新终端窗口（osascript / open），
+	// 放在 Update 里同步跑会把整个 UI 卡住
+	return m, m.launchSessionCmd(m.pick.path, m.pick.spawnScript, m.pick.session)
+}
+
+// sessionLaunchedMsg 会话启动结果（异步）
+type sessionLaunchedMsg struct {
+	output string
+	err    error
+}
+
+// launchSessionCmd 在后台线程里启动会话，结果回到事件循环
+func (m Model) launchSessionCmd(path, initScript string, mode config.SessionMode) tea.Cmd {
+	eval := m.eval
+	return func() tea.Msg {
+		launcher := session.New(mode)
+		var evalW *evalStdoutWriter
+		if eval {
+			evalW = &evalStdoutWriter{}
+		}
+		var buf strings.Builder
+		err := launcher.Launch(path, &buf, evalW, initScript)
+		return sessionLaunchedMsg{output: buf.String(), err: err}
 	}
-	if err := launcher.Launch(m.pick.path, &m.done.output, evalW, m.pick.spawnScript); err != nil {
-		m.done.output.WriteString(errStyle.Render("启动会话失败: "+err.Error()) + "\n")
-	}
-	return m, nil
 }
 
 func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if launched, ok := msg.(sessionLaunchedMsg); ok {
+		m.done.output = okStyle.Render("✓ worktree 创建成功") + "\n" + launched.output
+		if launched.err != nil {
+			m.done.output += errStyle.Render("启动会话失败: "+launched.err.Error()) + "\n"
+		}
+		return m, nil
+	}
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.String() {
 		case "enter", "q", "esc":
@@ -580,5 +689,5 @@ func (m Model) updateDone(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) viewDone() string {
-	return panelStyle.Render(m.done.output.String()) + "\n"
+	return panelStyle.Render(m.done.output) + "\n"
 }

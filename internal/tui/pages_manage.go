@@ -125,6 +125,12 @@ func (m Model) updateManage(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.manage.log = subtleStyle.Render(fmt.Sprintf("后台删除中: 剩余 %d 个", len(m.manage.pendingRemoves))) + "\n"
 		return m, nil
+	case sessionLaunchedMsg:
+		m.manage.log = msg.output
+		if msg.err != nil {
+			m.manage.log += errStyle.Render("启动会话失败: "+msg.err.Error()) + "\n"
+		}
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "q":
@@ -151,15 +157,9 @@ func (m Model) launchSelectedManageItem() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	wt := sel.Value.(git.Worktree)
-	launcher := session.New(m.cfg.SessionMode)
-	var evalW *evalStdoutWriter
-	if m.eval {
-		evalW = &evalStdoutWriter{}
-	}
-	var buf strings.Builder
-	_ = launcher.Launch(wt.Path, &buf, evalW, "")
-	m.manage.log = buf.String()
-	return m, nil
+	// 异步启动：spawn 模式要开新终端窗口，同步跑会卡住 UI
+	m.manage.log = "正在进入会话..."
+	return m, m.launchSessionCmd(wt.Path, "", m.cfg.SessionMode)
 }
 
 func (m Model) viewManage() string {

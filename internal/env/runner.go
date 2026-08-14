@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Phase 表示执行阶段
@@ -61,6 +62,11 @@ func Run(ctx context.Context, e *Environment, phase Phase, vars Vars, out io.Wri
 
 	shell, args := shellCommand(script)
 	cmd := exec.CommandContext(ctx, shell, args...)
+	// ctx 取消时连子孙进程一起杀：脚本里常是 pnpm install / 构建这类会拉一大串子进程的命令，
+	// 默认只杀最外层 shell，剩下的会变成孤儿继续跑
+	setProcGroup(cmd)
+	cmd.Cancel = func() error { return killGroup(cmd) }
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Env = append(os.Environ(), vars.ToEnv()...)
 	cmd.Stdout = out
 	cmd.Stderr = out

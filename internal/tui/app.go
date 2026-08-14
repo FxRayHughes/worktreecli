@@ -46,7 +46,6 @@ type Model struct {
 	width  int
 	height int
 
-
 	// 子模型
 	home    homeModel
 	branch  branchModel
@@ -113,6 +112,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			// onCreate 脚本正在跑的话先杀掉，别留孤儿进程在后台
+			if m.page == pageCreateRunning && m.running.cancel != nil {
+				m.running.cancel()
+			}
 			return m, tea.Quit
 		}
 	case tea.MouseMsg:
